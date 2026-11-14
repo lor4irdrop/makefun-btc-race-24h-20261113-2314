@@ -117,7 +117,8 @@ class Trader:
             return True
         return close * LONG_WIN * BPS >= total * (BPS - CRASH_LIMIT)
 
-    def handle_fills(self, fills):
+    # Fills land a bar late; settle each one against the tag it carries.
+    def settle_fills(self, fills):
         """Fold this batch's fills into the tracked positions."""
         for fill in fills or []:
             role = self.tags.pop(fill.get("client_id", ""), None)
@@ -144,7 +145,7 @@ class Trader:
     def decide(self, batch):
         """Return this batch's orders, updating state as we go."""
         self.n_batches += 1
-        self.handle_fills(batch.get("fills"))
+        self.settle_fills(batch.get("fills"))
 
         account = batch.get("account") or {}
         if account.get("cash_quote_units") is not None:
