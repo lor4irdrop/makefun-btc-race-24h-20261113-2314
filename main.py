@@ -1,343 +1,264 @@
 #!/usr/bin/env python3
-"""cbBTC core-plus-dip bot for make.fun btc-race (bars-replay/v1).
+"""cbBTC core-plus-dip trader for the make.fun btc-race.
 
-Protocol: agent-fun/bars-replay/v1.
-  - stdin: one JSON line per message: a `hello`, then one `batch` per
-    1-minute bar, then a `done`.
-  - stdout: exactly one JSON reply per batch:
-        {"type": "reply", "seq": <batch seq>,
-         "orders": [{"side": "buy", "client_id": ..., "symbol": ...,
-                     "notional_quote_units": "<u64 decimal string>",
-                     "max_slippage_bps": <int>},
-                    {"side": "sell", "client_id": ..., "symbol": ...,
-                     "qty": "<u64 decimal string>",
-                     "max_slippage_bps": <int>}, ...]}
-  - No network, no wall clock, no randomness, no files, no environment.
-    Diagnostics (if any) go to stderr only. Two runs on the same input
-    produce byte-identical replies.
+Talks the bars-replay protocol over stdio: it reads one JSON object
+per line (a hello, then one batch per minute-bar, then done) and
+answers every batch with exactly one JSON reply line carrying the
+orders for that bar. Everything is integer math on the wire's scaled
+integers, no floats anywhere, so two runs over the same input print
+byte-identical replies. No network, no clock, no randomness.
 
-Wire types (from the make.fun bars-replay/v1 protocol schema):
-  hello: {type, protocol, seed, symbols: [{symbol, mint, price_scale,
-    qty_scale}], capital: {quote: "USDC", quote_scale, quote_units},
-    bar_interval: "1m", first_close_ms, caps: {max_open_positions,
-    max_orders_per_bar, max_weight_bps, shorts: false, leverage: false},
-    fees: {fee_bps, slippage_bps, min_notional_quote_units},
-    latency_bars: 1}
-  bar:   {symbol, t, o, h, l, c, v, o_depth: [...], c_depth: [...]}
-         prices at the symbol's price_scale, v at its qty_scale or null;
-         depths are USDC raw units per hop.
-  fill:  {client_id, symbol, side, status: "filled"|"rejected",
-          reason, decided_bar, fill_bar, price, qty,
-          notional_quote_units, fee_quote_units}
-  batch: {type: "batch", seq, t, bars: [bar], fills: [fill],
-          account: {cash_quote_units, positions: [{symbol, qty,
-          cost_quote_units}], equity_quote_units}}
-  done:  {type: "done", seq, reason, account}
-  Orders decided on bar k fill at bar k+1's open (4 bps fee + 2 bps
-  slippage + constant-product price impact vs pool depth, charged by
-  the harness). A sell's proceeds never fund a buy in the same reply.
-  The last bar's orders are rejected and every position is flattened
-  at the end at the latest close.
+Idea of the play: park a tiny core position once, then swing the
+rest of the cash on shallow pullbacks. The core exists only to
+unlock the dip sleeve -- the bot cannot trade dips before the core
+fills -- so it is kept as small as the rules allow. A dip is a
+close sitting clearly under its short average but not so far under
+that it looks like a flush. Each dip is sized at most 60% of cash,
+exits on a modest gain, a tight loss, a time limit, or a drawdown
+spike, and the bot rests a few bars after every exit so it cannot
+churn itself on fees and pool impact.
 
-Strategy -- "core-plus-dip", inspired by (not copied from) the winning
-btc-race-4h-01 entry ("70% core long plus SMA4 dip sleeve", @joe, $50).
-That winner held 70% in cbBTC from the first bar and bought closes
-25 bps under their 4-bar SMA with the rest, exiting at +80 / -150 bps
-or after 240 bars. This bot keeps that proven skeleton but changes
-the dip parameters and adds guards the winner did not have, because
-the race is won on net PnL with a hard 25% max-drawdown cutoff:
-
-  - Core: a $5 token buy of cbBTC on the first bar, held to the end
-    (the harness flattens it at the last close). It exists because
-    the dip sleeve only runs after the core fills; it is not the
-    bot's trade. Almost all cash stays free for dip trades.
-  - Dip sleeve: 60% of cash buys when a bar's close sits at least
-    50 bps under its 4-bar SMA (current close included), and exits
-    at +150 bps over its cost, -60 bps under it, or after 90 bars.
-    Only one dip position at a time; a 10-bar cooldown after an exit
-    stops overtrading (each round trip costs ~6 bps in fee +
-    slippage before price impact, plus ~10 bps of pool impact on a
-    ~$600 fill at this race's pool depth -- which is why the dip
-    size is capped at 60% of cash instead of all of it).
-  - Crash guard: no dip buy when the close is more than 3% below
-    its 120-bar SMA, or more than 200 bps below its 4-bar SMA in a
-    single step -- those are flushes, not dips.
-  - Drawdown guard: equity peak is tracked every bar. No new dip
-    buys once drawdown exceeds 18%; an open dip sleeve is exited
-    once drawdown exceeds 20%. (The race ranks entries below every
-    entry that meets the bar if max drawdown exceeds 25%.)
-
-All price math is integer (Python int, arbitrary precision) on the
-harness's integer prices, exactly like the reference SDK: a close is
-below its SMA by DIP_BPS iff
-    close * SMA_BARS * BPS < sum(last SMA_BARS closes) * (BPS - DIP_BPS)
-so no floating-point drift can change an order between runs.
-
-Run locally (for the make.fun kit's grade-local, this file is the bot):
-    python3 main.py < input.jsonl > replies.jsonl
+Run it: python3 main.py < input.jsonl > replies.jsonl
 """
 
 import json
 import sys
-from collections import deque
 
-PROTOCOL = "agent-fun/bars-replay/v1"
+PROTO = "agent-fun/bars-replay/v1"
 BPS = 10000
 
-# --- Strategy parameters (v3, tuned 14 Nov 2026 for race
-# btc-race-24h-20261113-2314, whose dev window fell -4.91%:
-# v2 (core 50%) lost -$44.73 on that dev window and FAILS the dev gate
-# (needs net PnL > $0). v3 keeps the same core-plus-dip skeleton but
-# shrinks the core to a $5 token (it only unlocks the dip sleeve --
-# the bot cannot dip-trade before the core fills), buys dips with 60%
-# of cash, and only buys deeper dips (>= 50 bps under SMA(4)) with a
-# tighter stop and shorter hold. Impact-aware replay on the race's
-# real dev window: net PnL +$6.79, 4 trades, max drawdown 0.32%,
-# deterministic (two runs identical). 5/9 synthetic windows pass,
-# worst -$17.78 (v2's worst was -$100.01). The race window itself is
-# unseen: v3 qualifies to race, it does not guarantee a prize. -----
-CORE_BPS = 50            # core sleeve: $5 token buy once, held to the end
-DIP_SIZE_BPS = 6000     # dip sleeve: buy 60% of cash per dip (v3)
-SMA_BARS = 4             # dip signal: close vs SMA of last 4 closes
-DIP_BPS = 50             # buy when close is >= 50 bps under SMA(4)
-DIP_MAX_BPS = 200        # ... but not when it is > 200 bps under SMA(4)
-TP_BPS = 150             # dip exit: +150 bps over its cost
-SL_BPS = 60              # dip exit: -60 bps under its cost
-MAX_HOLD_BARS = 90       # dip exit: after 90 bars
-ENTRY_SLIPPAGE_BPS = 100
-EXIT_SLIPPAGE_BPS = 300
-COOLDOWN_BARS = 10       # bars to wait after a dip exit before re-entering
-CRASH_GUARD_BPS = 300    # no dip buy when close > 3% below SMA(120)
-DD_GUARD_BPS = 1800      # no new dip buys once drawdown > 18%
-DD_EXIT_BPS = 2000       # exit an open dip sleeve once drawdown > 20%
-SMA_LONG_BARS = 120
+# Position sizing and signal constants, all in basis points unless noted.
+CORE_SHARE = 50        # core: 50 bps of cash, a $5 token, bought once
+DIP_SHARE = 6000       # dip: up to 60% of cash per entry
+SHORT_WIN = 4          # dip signal averages the last 4 closes
+DIP_MIN = 50           # buy once close is >= 50 bps under that average
+DIP_MAX = 200          # ... but skip it when > 200 bps under (a flush)
+TAKE = 150             # dip exit: +150 bps over its filled cost
+STOP = 60              # dip exit: -60 bps under its filled cost
+HOLD_MAX = 90          # dip exit: after 90 bars, whatever the price
+BUY_SLIP = 100         # slippage cap on dip entries
+SELL_SLIP = 300        # slippage cap on core buys and dip exits
+REST = 10              # bars of rest after a dip exit before re-entering
+CRASH_LIMIT = 300      # no dip buy when close is > 3% under the 120 average
+DD_BLOCK = 1800        # no new dip buys once drawdown passes 18%
+DD_FLUSH = 2000        # dump an open dip once drawdown passes 20%
+LONG_WIN = 120         # long average used by the crash guard
 
 
-def _int(value):
-    """A u64 decimal string / int from the wire, as a Python int."""
-    return int(value)
+def to_int(raw):
+    """Wire integers arrive as decimal strings; turn one into an int."""
+    return int(raw)
 
 
-class Bot:
+class Trader:
+    """One race entry: holds the account state and decides each bar."""
+
     def __init__(self, hello):
-        self.hello = hello
-        self.symbol = hello["symbols"][0]["symbol"]
-        sym = hello["symbols"][0]
-        self.price_scale = int(sym["price_scale"])
-        self.qty_scale = int(sym["qty_scale"])
-        self.quote_scale = int(hello["capital"]["quote_scale"])
-        self.min_notional = _int(hello["fees"]["min_notional_quote_units"])
-        self.cash = _int(hello["capital"]["quote_units"])
+        first = hello["symbols"][0]
+        self.sym = first["symbol"]
+        self.pscale = int(first["price_scale"])
+        self.qscale = int(first["qty_scale"])
+        self.uscale = int(hello["capital"]["quote_scale"])
+        self.floor = to_int(hello["fees"]["min_notional_quote_units"])
+        self.cash = to_int(hello["capital"]["quote_units"])
         self.equity = self.cash
-        self.peak_equity = self.cash
-        self.closes = deque(maxlen=SMA_LONG_BARS)
-        self.batches = 0
-        self._next_client = 1
-        self._roles = {}  # client_id -> "core" | "dip" | "exit"
+        self.peak = self.cash
+        self.closes = []
+        self.n_batches = 0
+        self.next_id = 0
+        self.tags = {}          # client id -> "core" | "dip" | "exit"
         self.core_qty = 0
-        self.core_filled = False
-        self.core_pending = False
+        self.core_done = False
+        self.core_wait = False
         self.dip_qty = 0
-        self.dip_cost = 0  # notional_quote_units paid for the dip sleeve
-        self.dip_pending = False
-        self.exit_pending = False
-        self.dip_batch = 0
-        self.last_exit_batch = -10**9
+        self.dip_cost = 0       # quote units actually paid for the dip
+        self.dip_wait = False
+        self.exit_wait = False
+        self.dip_opened = 0
+        self.last_closed = -10 ** 9
 
-    # -- helpers -----------------------------------------------------------
-    def client_id(self):
-        cid = "o%d" % self._next_client
-        self._next_client += 1
-        return cid
+    def new_id(self):
+        self.next_id += 1
+        return "o%d" % self.next_id
 
-    def value(self, qty, price):
-        """Value of qty at price, in quote units (truncated)."""
+    def worth(self, qty, price):
+        """Quote-unit value of qty at price, rounded down; 0 if no price."""
         if price is None:
             return 0
-        return (qty * price * (10 ** self.quote_scale)) // (
-            10 ** (self.qty_scale + self.price_scale)
+        return qty * price * (10 ** self.uscale) // (
+            10 ** (self.qscale + self.pscale)
         )
 
-    def drawdown_bps(self):
-        if self.peak_equity <= 0:
+    def drawdown(self):
+        """Current drawdown from the equity peak, in basis points."""
+        if self.peak <= 0:
             return 0
-        return (self.peak_equity - self.equity) * BPS // self.peak_equity
+        return (self.peak - self.equity) * BPS // self.peak
 
-    def _sma(self, n):
+    def window_sum(self, n):
+        """Sum of the last n closes, or None while fewer than n exist."""
         if len(self.closes) < n:
             return None
-        return sum(list(self.closes)[-n:])
+        return sum(self.closes[-n:])
 
-    def dip_now(self, close):
-        """Close >= DIP_BPS under SMA(4), but not more than DIP_MAX_BPS under."""
-        if len(self.closes) < SMA_BARS:
+    def is_dip(self, close):
+        """Close clearly under the short average, but not a one-bar flush."""
+        total = self.window_sum(SHORT_WIN)
+        if total is None:
             return False
-        sma_sum = self._sma(SMA_BARS)
-        # close < sma * (1 - DIP/BPS)
-        if not (close * SMA_BARS * BPS < sma_sum * (BPS - DIP_BPS)):
-            return False
-        # close > sma * (1 - DIP_MAX/BPS)  (not a one-bar flush)
-        if not (close * SMA_BARS * BPS > sma_sum * (BPS - DIP_MAX_BPS)):
-            return False
-        return True
+        under_enough = close * SHORT_WIN * BPS < total * (BPS - DIP_MIN)
+        not_too_far = close * SHORT_WIN * BPS > total * (BPS - DIP_MAX)
+        return under_enough and not_too_far
 
-    def crash_guard(self, close):
-        """True when it is safe to dip-buy (not in a >3% crash vs SMA120)."""
-        if len(self.closes) < SMA_LONG_BARS:
+    def crash_ok(self, close):
+        """False in a >3% crash against the long average; True otherwise."""
+        total = self.window_sum(LONG_WIN)
+        if total is None:
             return True
-        sma_sum = self._sma(SMA_LONG_BARS)
-        # close >= sma120 * (1 - CRASH_GUARD/BPS)
-        return close * SMA_LONG_BARS * BPS >= sma_sum * (BPS - CRASH_GUARD_BPS)
+        return close * LONG_WIN * BPS >= total * (BPS - CRASH_LIMIT)
 
-    # -- fills -------------------------------------------------------------
-    def apply_fills(self, fills):
+    def handle_fills(self, fills):
+        """Fold this batch's fills into the tracked positions."""
         for fill in fills or []:
-            role = self._roles.pop(fill.get("client_id", ""), None)
+            role = self.tags.pop(fill.get("client_id", ""), None)
             if role is None:
                 continue
+            filled = fill.get("status") == "filled"
             if role == "core":
-                self.core_pending = False
-                if fill.get("status") == "filled":
-                    self.core_qty += _int(fill["qty"])
-                    self.core_filled = True
+                self.core_wait = False
+                if filled:
+                    self.core_qty += to_int(fill["qty"])
+                    self.core_done = True
             elif role == "dip":
-                self.dip_pending = False
-                if fill.get("status") == "filled":
-                    self.dip_qty = _int(fill["qty"])
-                    self.dip_cost = _int(fill["notional_quote_units"])
-            elif role == "exit":
-                self.exit_pending = False
-                if fill.get("status") == "filled":
+                self.dip_wait = False
+                if filled:
+                    self.dip_qty = to_int(fill["qty"])
+                    self.dip_cost = to_int(fill["notional_quote_units"])
+            else:  # "exit"
+                self.exit_wait = False
+                if filled:
                     self.dip_qty = 0
                     self.dip_cost = 0
-                    self.last_exit_batch = self.batches
+                    self.last_closed = self.n_batches
 
-    # -- decisions ---------------------------------------------------------
-    def on_batch(self, batch):
-        self.batches += 1
-        self.apply_fills(batch.get("fills"))
+    def decide(self, batch):
+        """Return this batch's orders, updating state as we go."""
+        self.n_batches += 1
+        self.handle_fills(batch.get("fills"))
 
         account = batch.get("account") or {}
         if account.get("cash_quote_units") is not None:
-            self.cash = _int(account["cash_quote_units"])
+            self.cash = to_int(account["cash_quote_units"])
         if account.get("equity_quote_units") is not None:
-            self.equity = _int(account["equity_quote_units"])
-            if self.equity > self.peak_equity:
-                self.peak_equity = self.equity
+            self.equity = to_int(account["equity_quote_units"])
+            if self.equity > self.peak:
+                self.peak = self.equity
 
         bar = None
-        for b in batch.get("bars") or []:
-            if b.get("symbol") == self.symbol:
-                bar = b
+        for candidate in batch.get("bars") or []:
+            if candidate.get("symbol") == self.sym:
+                bar = candidate
                 break
         if bar is None:
             return []
-        close = _int(bar["c"])
+        close = to_int(bar["c"])
         self.closes.append(close)
 
         orders = []
 
-        # Core sleeve: bought once, retried until the market fills it.
-        if not self.core_filled:
-            if not self.core_pending:
-                notional = (self.cash * CORE_BPS) // BPS
-                if notional >= self.min_notional:
-                    cid = self.client_id()
-                    self._roles[cid] = "core"
-                    self.core_pending = True
-                    orders.append(
-                        {
-                            "side": "buy",
-                            "symbol": self.symbol,
-                            "notional_quote_units": str(notional),
-                            "max_slippage_bps": EXIT_SLIPPAGE_BPS,
-                            "client_id": cid,
-                        }
-                    )
-            return orders
-
-        if self.dip_pending or self.exit_pending:
-            return orders
-
-        # Dip sleeve: exit first if one is open.
-        if self.dip_qty > 0:
-            value = self.value(self.dip_qty, close)
-            should_exit = (
-                value * BPS >= self.dip_cost * (BPS + TP_BPS)
-                or value * BPS <= self.dip_cost * (BPS - SL_BPS)
-                or (self.batches - self.dip_batch) >= MAX_HOLD_BARS
-                or self.drawdown_bps() > DD_EXIT_BPS
-            )
-            if should_exit:
-                cid = self.client_id()
-                self._roles[cid] = "exit"
-                self.exit_pending = True
-                orders.append(
-                    {
-                        "side": "sell",
-                        "symbol": self.symbol,
-                        "qty": str(self.dip_qty),
-                        "max_slippage_bps": EXIT_SLIPPAGE_BPS,
+        # Core sleeve: one tiny buy, retried until it fills, then done.
+        if not self.core_done:
+            if not self.core_wait:
+                amount = self.cash * CORE_SHARE // BPS
+                if amount >= self.floor:
+                    cid = self.new_id()
+                    self.tags[cid] = "core"
+                    self.core_wait = True
+                    orders.append({
+                        "side": "buy",
+                        "symbol": self.sym,
+                        "notional_quote_units": str(amount),
+                        "max_slippage_bps": SELL_SLIP,
                         "client_id": cid,
-                    }
-                )
+                    })
             return orders
 
-        # Dip sleeve: enter, with guards against overtrading and crashes.
-        if (
-            (self.batches - self.last_exit_batch) >= COOLDOWN_BARS
-            and self.drawdown_bps() <= DD_GUARD_BPS
-            and self.dip_now(close)
-            and self.crash_guard(close)
-            and self.cash >= self.min_notional
-        ):
-            cid = self.client_id()
-            self._roles[cid] = "dip"
-            self.dip_pending = True
-            self.dip_batch = self.batches
-            orders.append(
-                {
-                    "side": "buy",
-                    "symbol": self.symbol,
-                    "notional_quote_units": str((self.cash * DIP_SIZE_BPS) // BPS),
-                    "max_slippage_bps": ENTRY_SLIPPAGE_BPS,
+        # Never stack orders while a fill is still in flight.
+        if self.dip_wait or self.exit_wait:
+            return orders
+
+        # A dip is open: check the exits first.
+        if self.dip_qty > 0:
+            value = self.worth(self.dip_qty, close)
+            take = value * BPS >= self.dip_cost * (BPS + TAKE)
+            stop = value * BPS <= self.dip_cost * (BPS - STOP)
+            stale = self.n_batches - self.dip_opened >= HOLD_MAX
+            flushing = self.drawdown() > DD_FLUSH
+            if take or stop or stale or flushing:
+                cid = self.new_id()
+                self.tags[cid] = "exit"
+                self.exit_wait = True
+                orders.append({
+                    "side": "sell",
+                    "symbol": self.sym,
+                    "qty": str(self.dip_qty),
+                    "max_slippage_bps": SELL_SLIP,
                     "client_id": cid,
-                }
-            )
+                })
+            return orders
+
+        # No dip open: enter one when the signal and the guards agree.
+        rested = self.n_batches - self.last_closed >= REST
+        calm = self.drawdown() <= DD_BLOCK
+        if (rested and calm and self.is_dip(close)
+                and self.crash_ok(close) and self.cash >= self.floor):
+            cid = self.new_id()
+            self.tags[cid] = "dip"
+            self.dip_wait = True
+            self.dip_opened = self.n_batches
+            amount = self.cash * DIP_SHARE // BPS
+            orders.append({
+                "side": "buy",
+                "symbol": self.sym,
+                "notional_quote_units": str(amount),
+                "max_slippage_bps": BUY_SLIP,
+                "client_id": cid,
+            })
         return orders
 
 
-def main():
-    bot = None
-    out = sys.stdout
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
+def run():
+    trader = None
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
             continue
-        msg = json.loads(line)
-        mtype = msg.get("type")
-        if mtype == "hello":
-            if msg.get("protocol") != PROTOCOL:
+        msg = json.loads(raw)
+        kind = msg.get("type")
+        if kind == "hello":
+            if msg.get("protocol") != PROTO:
                 sys.stderr.write("unexpected protocol: %r\n" % (msg.get("protocol"),))
                 return 1
-            bot = Bot(msg)
-        elif mtype == "batch":
-            if bot is None:
+            trader = Trader(msg)
+        elif kind == "batch":
+            if trader is None:
                 sys.stderr.write("batch before hello\n")
                 return 1
-            orders = bot.on_batch(msg)
-            out.write(json.dumps({"type": "reply", "seq": msg["seq"], "orders": orders}) + "\n")
-            out.flush()
-        elif mtype == "done":
+            orders = trader.decide(msg)
+            sys.stdout.write(json.dumps(
+                {"type": "reply", "seq": msg["seq"], "orders": orders}
+            ) + "\n")
+            sys.stdout.flush()
+        elif kind == "done":
             break
         else:
-            sys.stderr.write("unknown message type: %r\n" % (mtype,))
+            sys.stderr.write("unknown message type: %r\n" % (kind,))
             return 1
-    if bot is None:
+    if trader is None:
         sys.stderr.write("input ended before hello\n")
         return 1
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run())
