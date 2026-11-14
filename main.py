@@ -134,7 +134,7 @@ class Trader:
                 if filled:
                     self.dip_qty = to_int(fill["qty"])
                     self.dip_cost = to_int(fill["notional_quote_units"])
-            else:  # "exit"
+            elif role == "exit":
                 self.exit_wait = False
                 if filled:
                     self.dip_qty = 0
