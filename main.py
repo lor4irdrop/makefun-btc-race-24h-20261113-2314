@@ -29,9 +29,9 @@ Wire types (from the make.fun bars-replay/v1 protocol schema):
   fill:  {client_id, symbol, side, status: "filled"|"rejected",
           reason, decided_bar, fill_bar, price, qty,
           notional_quote_units, fee_quote_units}
-  batch: {type: "batch", "seq", "t", "bars": [bar], "fills": [fill],
-          "account": {cash_quote_units, "positions": [{symbol, qty,
-          "cost_quote_units"}], "equity_quote_units"}}
+  batch: {type: "batch", seq, t, bars: [bar], fills: [fill],
+          account: {cash_quote_units, positions: [{symbol, qty,
+          cost_quote_units}], equity_quote_units}}
   done:  {type: "done", seq, reason, account}
   Orders decided on bar k fill at bar k+1's open (4 bps fee + 2 bps
   slippage + constant-product price impact vs pool depth, charged by
@@ -73,18 +73,6 @@ below its SMA by DIP_BPS iff
     close * SMA_BARS * BPS < sum(last SMA_BARS closes) * (BPS - DIP_BPS)
 so no floating-point drift can change an order between runs.
 
-Grade on this race's dev window (faithful local replay of the kit's
-harness, fee + slippage + constant-product impact, 1,440 real bars):
-net PnL +$6.79, 4 trades, max drawdown 0.32%, deterministic. The
-dev window falls -4.91% (71,409 -> 67,901), so the gate is passed by
-one winning dip scalp, not by holding. The v2 bot this is tuned
-from (core 50%, DIP 30, TP +60, SL -120) scores -$46.22 on the same
-window with impact modelled (-$44.73 without it) and fails the gate.
-Robustness: 5/9 synthetic windows pass, worst -$17.78 (v2's worst
-was -$100.01). The race window itself is unseen: v3 qualifies to
-race, it does not guarantee a prize. Verified 14 Nov 2026 ~07:20 WIB
-by two independent impact-aware replays (this file, both +$6.79).
-
 Run locally (for the make.fun kit's grade-local, this file is the bot):
     python3 main.py < input.jsonl > replies.jsonl
 """
@@ -105,7 +93,9 @@ BPS = 10000
 # of cash, and only buys deeper dips (>= 50 bps under SMA(4)) with a
 # tighter stop and shorter hold. Impact-aware replay on the race's
 # real dev window: net PnL +$6.79, 4 trades, max drawdown 0.32%,
-# deterministic. v2 is kept in ~/workspace/btc-race-bot/submission/main.py.)
+# deterministic (two runs identical). 5/9 synthetic windows pass,
+# worst -$17.78 (v2's worst was -$100.01). The race window itself is
+# unseen: v3 qualifies to race, it does not guarantee a prize. -----
 CORE_BPS = 50            # core sleeve: $5 token buy once, held to the end
 DIP_SIZE_BPS = 6000     # dip sleeve: buy 60% of cash per dip (v3)
 SMA_BARS = 4             # dip signal: close vs SMA of last 4 closes
@@ -341,7 +331,7 @@ def main():
         elif mtype == "done":
             break
         else:
-            sys.stderr.write("unknown message type: %r\n" % (msg.get("type"),))
+            sys.stderr.write("unknown message type: %r\n" % (mtype,))
             return 1
     if bot is None:
         sys.stderr.write("input ended before hello\n")
