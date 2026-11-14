@@ -47,16 +47,18 @@ or after 240 bars. This bot keeps that proven skeleton but changes
 the dip parameters and adds guards the winner did not have, because
 the race is won on net PnL with a hard 25% max-drawdown cutoff:
 
-  - Core: 1% of starting cash into cbBTC on the first bar, held to
-    the end (the harness flattens it at the last close). The core is
-    kept tiny for this race because its dev window falls -4.91%: a
-    50% core would lose ~$25 there and fail the dev gate on its own.
-  - Dip sleeve: the remaining ~99% buys when a bar's close sits at
-    least 45 bps under its 4-bar SMA (current close included), and
-    exits at +50 bps over its cost, -60 bps under it, or after
-    240 bars. Only one dip position at a time; a 10-bar cooldown
-    after an exit stops overtrading (each round trip costs ~22 bps
-    in fee + slippage + price impact).
+  - Core: a $5 token buy of cbBTC on the first bar, held to the end
+    (the harness flattens it at the last close). It exists because
+    the dip sleeve only runs after the core fills; it is not the
+    bot's trade. Almost all cash stays free for dip trades.
+  - Dip sleeve: 60% of cash buys when a bar's close sits at least
+    50 bps under its 4-bar SMA (current close included), and exits
+    at +150 bps over its cost, -60 bps under it, or after 90 bars.
+    Only one dip position at a time; a 10-bar cooldown after an exit
+    stops overtrading (each round trip costs ~6 bps in fee +
+    slippage before price impact, plus ~10 bps of pool impact on a
+    ~$600 fill at this race's pool depth -- which is why the dip
+    size is capped at 60% of cash instead of all of it).
   - Crash guard: no dip buy when the close is more than 3% below
     its 120-bar SMA, or more than 200 bps below its 4-bar SMA in a
     single step -- those are flushes, not dips.
@@ -73,9 +75,15 @@ so no floating-point drift can change an order between runs.
 
 Grade on this race's dev window (faithful local replay of the kit's
 harness, fee + slippage + constant-product impact, 1,440 real bars):
-net PnL +$4.20, 4 trades, max drawdown 0.61%, deterministic. The
+net PnL +$6.79, 4 trades, max drawdown 0.32%, deterministic. The
 dev window falls -4.91% (71,409 -> 67,901), so the gate is passed by
-one winning dip scalp, not by holding.
+one winning dip scalp, not by holding. The v2 bot this is tuned
+from (core 50%, DIP 30, TP +60, SL -120) scores -$46.22 on the same
+window with impact modelled (-$44.73 without it) and fails the gate.
+Robustness: 5/9 synthetic windows pass, worst -$17.78 (v2's worst
+was -$100.01). The race window itself is unseen: v3 qualifies to
+race, it does not guarantee a prize. Verified 14 Nov 2026 ~07:20 WIB
+by two independent impact-aware replays (this file, both +$6.79).
 
 Run locally (for the make.fun kit's grade-local, this file is the bot):
     python3 main.py < input.jsonl > replies.jsonl
@@ -88,18 +96,24 @@ from collections import deque
 PROTOCOL = "agent-fun/bars-replay/v1"
 BPS = 10000
 
-# --- Strategy parameters (v3, tuned 14 Nov 2026 for
-# btc-race-24h-20261113-2314: dev window falls -4.91%, so the core is
-# cut to 1% and the dip sleeve scalps deeper dips (45 bps) with a
-# tight +50/-60 exit. v2 was core 50%, DIP 30, TP +60, SL -120,
-# kept in ~/workspace/btc-race-bot/submission/main.py.) -----------------
-CORE_BPS = 100           # core sleeve: 1% of starting cash, buy once, hold
+# --- Strategy parameters (v3, tuned 14 Nov 2026 for race
+# btc-race-24h-20261113-2314, whose dev window fell -4.91%:
+# v2 (core 50%) lost -$44.73 on that dev window and FAILS the dev gate
+# (needs net PnL > $0). v3 keeps the same core-plus-dip skeleton but
+# shrinks the core to a $5 token (it only unlocks the dip sleeve --
+# the bot cannot dip-trade before the core fills), buys dips with 60%
+# of cash, and only buys deeper dips (>= 50 bps under SMA(4)) with a
+# tighter stop and shorter hold. Impact-aware replay on the race's
+# real dev window: net PnL +$6.79, 4 trades, max drawdown 0.32%,
+# deterministic. v2 is kept in ~/workspace/btc-race-bot/submission/main.py.)
+CORE_BPS = 50            # core sleeve: $5 token buy once, held to the end
+DIP_SIZE_BPS = 6000     # dip sleeve: buy 60% of cash per dip (v3)
 SMA_BARS = 4             # dip signal: close vs SMA of last 4 closes
-DIP_BPS = 45             # buy when close is >= 45 bps under SMA(4)
+DIP_BPS = 50             # buy when close is >= 50 bps under SMA(4)
 DIP_MAX_BPS = 200        # ... but not when it is > 200 bps under SMA(4)
-TP_BPS = 50              # dip exit: +50 bps over its cost
+TP_BPS = 150             # dip exit: +150 bps over its cost
 SL_BPS = 60              # dip exit: -60 bps under its cost
-MAX_HOLD_BARS = 240      # dip exit: after 240 bars
+MAX_HOLD_BARS = 90       # dip exit: after 90 bars
 ENTRY_SLIPPAGE_BPS = 100
 EXIT_SLIPPAGE_BPS = 300
 COOLDOWN_BARS = 10       # bars to wait after a dip exit before re-entering
@@ -295,7 +309,7 @@ class Bot:
                 {
                     "side": "buy",
                     "symbol": self.symbol,
-                    "notional_quote_units": str(self.cash),
+                    "notional_quote_units": str((self.cash * DIP_SIZE_BPS) // BPS),
                     "max_slippage_bps": ENTRY_SLIPPAGE_BPS,
                     "client_id": cid,
                 }
